@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { MeshSurfaceSampler } from 'three/addons/math/MeshSurfaceSampler.js';
 import { createNoise2D } from 'simplex-noise';
 import { Tree } from '@dgreenheck/ez-tree';
 
@@ -412,6 +413,7 @@ const leafMaterial = new THREE.MeshLambertMaterial({
 });
 
 const treeVariants = [];
+const variantTopY = [];  // tree-local max y per variant (for climbing)
 for (let v = 0; v < TREE_VARIANTS; v++) {
   const t = new Tree();
   t.options.seed = v * 137 + 17;
@@ -423,14 +425,18 @@ for (let v = 0; v < TREE_VARIANTS; v++) {
   t.generate();
   t.updateMatrixWorld(true);
   const subs = [];
+  let topY = 0;
   t.traverse((o) => {
     if (!o.isMesh) return;
     const g = o.geometry.clone();
     g.applyMatrix4(o.matrixWorld);
+    g.computeBoundingBox();
+    if (g.boundingBox.max.y > topY) topY = g.boundingBox.max.y;
     const isLeaf = o.material && o.material.name === 'leaves';
     subs.push({ geometry: g, material: isLeaf ? leafMaterial : barkMaterial });
   });
   treeVariants.push(subs);
+  variantTopY.push(topY);
 }
 
 const variantTransforms = treeVariants.map(() => []);
@@ -450,7 +456,7 @@ const variantTransforms = treeVariants.map(() => []);
       new THREE.Vector3(x, y, z), q, new THREE.Vector3(scl, scl, scl)
     ));
     // ez-tree default trunk radius is 1.5 units; scale carries through to world space.
-    treeColliders.push({ x, z, r: 1.5 * scl + DUCK_RADIUS });
+    treeColliders.push({ x, z, r: 1.5 * scl + DUCK_RADIUS, top: y + variantTopY[vi] * scl });
     placed++;
   }
 }
@@ -467,6 +473,63 @@ for (let vi = 0; vi < TREE_VARIANTS; vi++) {
     im.instanceMatrix.needsUpdate = true;
     scene.add(im);
   }
+}
+
+// === Tiny white flowers scattered on tree leaves ===
+// Per-variant leaf samplers — sample a max pool of points each, take a random subset per tree.
+const TREE_FLOWER_MAX_PER_TREE = 80;  // upper bound; each tree picks 0..this many
+const TREE_FLOWER_RADIUS       = 0.12;
+
+const variantLeafPool = [];  // [variantIdx] → array of THREE.Vector3 in variant-local space
+for (let vi = 0; vi < TREE_VARIANTS; vi++) {
+  const leafSub = treeVariants[vi].find((s) => s.material === leafMaterial);
+  if (!leafSub) { variantLeafPool.push(null); continue; }
+  const sampler = new MeshSurfaceSampler(new THREE.Mesh(leafSub.geometry)).build();
+  const pool = [];
+  const tmp = new THREE.Vector3();
+  for (let k = 0; k < 160; k++) {  // bigger pool so more flowers can be picked per tree
+    sampler.sample(tmp);
+    pool.push(tmp.clone());
+  }
+  variantLeafPool.push(pool);
+}
+
+// Build world-space matrices for every flower across every tree.
+const _flowerWorld = new THREE.Vector3();
+const _flowerScl   = new THREE.Vector3(1, 1, 1);
+const _flowerQuat  = new THREE.Quaternion();
+const treeFlowerMats = [];
+for (let vi = 0; vi < TREE_VARIANTS; vi++) {
+  const pool = variantLeafPool[vi];
+  if (!pool) continue;
+  for (const treeMat of variantTransforms[vi]) {
+    // Per tree: random count (some trees 0, some many).
+    // Bias toward more flowers (exponent < 1) so most trees bloom densely; some still empty.
+    const n = Math.floor(Math.pow(Math.random(), 0.6) * (TREE_FLOWER_MAX_PER_TREE + 1));
+    if (n === 0) continue;
+    // Pick n distinct local positions from the pool.
+    const indices = [];
+    while (indices.length < n) {
+      const k = Math.floor(Math.random() * pool.length);
+      if (!indices.includes(k)) indices.push(k);
+    }
+    for (const idx of indices) {
+      _flowerWorld.copy(pool[idx]).applyMatrix4(treeMat);
+      const m = new THREE.Matrix4().compose(_flowerWorld, _flowerQuat, _flowerScl);
+      treeFlowerMats.push(m);
+    }
+  }
+}
+
+if (treeFlowerMats.length > 0) {
+  const flowerGeom = new THREE.SphereGeometry(TREE_FLOWER_RADIUS, 6, 5);
+  const flowerMat  = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  const treeFlowers = new THREE.InstancedMesh(flowerGeom, flowerMat, treeFlowerMats.length);
+  treeFlowers.castShadow = false;
+  treeFlowers.receiveShadow = true;
+  for (let i = 0; i < treeFlowerMats.length; i++) treeFlowers.setMatrixAt(i, treeFlowerMats[i]);
+  treeFlowers.instanceMatrix.needsUpdate = true;
+  scene.add(treeFlowers);
 }
 
 // === Animated grass (al-ro slerp wind + FluffyGrass tip-color & height variation) ===
@@ -871,6 +934,15 @@ const SPEED = 6;
 const ROT_SPEED = 10;
 const CAM_HEIGHT = 1.8;
 
+// === Tree climbing ===
+const CLIMB_RANGE_BUFFER = 1.5;  // extra distance beyond trunk radius where spacebar is accepted
+const CLIMB_DURATION     = 1.2;
+let climbState  = 'normal';  // 'normal' | 'up' | 'top' | 'down'
+let climbT      = 0;
+let prevSpace   = false;
+const climbStart  = new THREE.Vector3();
+const climbTarget = new THREE.Vector3();
+
 const clock = new THREE.Clock();
 
 let totalElapsed = 0;
@@ -880,11 +952,43 @@ function animate() {
   grassMaterial.uniforms.time.value = totalElapsed * 0.25;
   windUniform.value = totalElapsed;
 
+  // Spacebar edge-trigger for climbing.
+  const spaceDown    = !!keys['Space'];
+  const spacePressed = spaceDown && !prevSpace;
+  prevSpace = spaceDown;
+
+  if (spacePressed) {
+    if (climbState === 'normal') {
+      // Find the closest climbable tree within range.
+      let bestI = -1, bestD = Infinity;
+      for (let i = 0; i < treeColliders.length; i++) {
+        const t = treeColliders[i];
+        const dx = t.x - player.position.x, dz = t.z - player.position.z;
+        const d  = Math.sqrt(dx*dx + dz*dz);
+        if (d < t.r + CLIMB_RANGE_BUFFER && d < bestD) { bestD = d; bestI = i; }
+      }
+      if (bestI >= 0) {
+        const t = treeColliders[bestI];
+        climbStart.copy(player.position);
+        climbTarget.set(t.x, t.top + 0.2, t.z);
+        climbT = 0;
+        climbState = 'up';
+      }
+    } else if (climbState === 'top') {
+      climbStart.copy(player.position);
+      climbTarget.set(player.position.x, getTerrainHeight(player.position.x, player.position.z), player.position.z);
+      climbT = 0;
+      climbState = 'down';
+    }
+  }
+
   let mx = 0, mz = 0;
-  if (keys['KeyW'] || keys['ArrowUp'])    mz -= 1;
-  if (keys['KeyS'] || keys['ArrowDown'])  mz += 1;
-  if (keys['KeyA'] || keys['ArrowLeft'])  mx -= 1;
-  if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+  if (climbState === 'normal') {
+    if (keys['KeyW'] || keys['ArrowUp'])    mz -= 1;
+    if (keys['KeyS'] || keys['ArrowDown'])  mz += 1;
+    if (keys['KeyA'] || keys['ArrowLeft'])  mx -= 1;
+    if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+  }
   const moving = mx || mz;
 
   if (moving) {
@@ -895,7 +999,6 @@ function animate() {
     const wz = -mx * sin + mz * cos;
     let nx = player.position.x + wx * SPEED * dt;
     let nz = player.position.z + wz * SPEED * dt;
-    // Push the duck out of any tree it would intersect (sphere-sphere on the XZ plane).
     for (let i = 0; i < treeColliders.length; i++) {
       const t = treeColliders[i];
       const ddx = nx - t.x, ddz = nz - t.z;
@@ -916,7 +1019,16 @@ function animate() {
     player.rotation.y += diff * Math.min(1, ROT_SPEED * dt);
   }
 
-  player.position.y = getTerrainHeight(player.position.x, player.position.z);
+  if (climbState === 'normal') {
+    player.position.y = getTerrainHeight(player.position.x, player.position.z);
+  } else if (climbState === 'up' || climbState === 'down') {
+    climbT += dt / CLIMB_DURATION;
+    const tt = Math.min(1, climbT);
+    const eased = 0.5 - 0.5 * Math.cos(tt * Math.PI);  // ease in-out
+    player.position.lerpVectors(climbStart, climbTarget, eased);
+    if (tt >= 1) climbState = (climbState === 'up') ? 'top' : 'normal';
+  }
+  // 'top' state: hold position at climbTarget, no terrain snap, no movement.
 
   sun.position.set(player.position.x + 50, player.position.y + 80, player.position.z + 30);
   sun.target.position.copy(player.position);
