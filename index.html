@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Duck Explorer</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #87ceeb; }
+    canvas { display: block; }
+    #hud {
+      position: fixed; top: 12px; left: 12px;
+      font: 14px/1.4 -apple-system, system-ui, sans-serif;
+      color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.5);
+      pointer-events: none; user-select: none;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://esm.sh/three@0.166.0",
+      "three/addons/": "https://esm.sh/three@0.166.0/examples/jsm/",
+      "@dgreenheck/ez-tree": "https://esm.sh/@dgreenheck/ez-tree?deps=three@0.166.0",
+      "simplex-noise": "https://esm.sh/simplex-noise@4"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="hud">WASD to move &middot; drag mouse to orbit</div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
