@@ -30,6 +30,336 @@ s.left = -25; s.right = 25; s.top = 25; s.bottom = -25; s.near = 1; s.far = 200;
 scene.add(sun);
 scene.add(sun.target);  // sun follows player so the small shadow frustum always covers them
 
+// === Clouds: ported from dghez/THREEJS_Procedural-clouds — billboard planes with FBM-displaced
+// alpha. Uses procedurally-built shape + noise textures (no external image assets).
+const CLOUD_COUNT  = 55;
+const CLOUD_HEIGHT = 55;
+const CLOUD_FIELD  = 320;
+
+function makeCloudShapeTex(size = 64) {
+  const data = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = (x / size - 0.5) * 2;
+      const dy = (y / size - 0.5) * 2;
+      const r  = Math.sqrt(dx*dx + dy*dy);
+      // Soft elliptical falloff: full white center, fading to transparent at edges.
+      const v  = Math.max(0, 1 - Math.pow(r, 1.6));
+      const c  = Math.floor(v * 255);
+      const i  = (y * size + x) * 4;
+      data[i] = c; data[i+1] = c; data[i+2] = c; data[i+3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, size, size);
+  tex.needsUpdate = true;
+  return tex;
+}
+function makeCloudNoiseTex(size = 128) {
+  const data = new Uint8Array(size * size * 4);
+  const n = createNoise2D();
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      let v = 0.5 + 0.4 * n(x * 0.04, y * 0.04) + 0.2 * n(x * 0.13, y * 0.13);
+      v = Math.max(0, Math.min(1, v));
+      const c = Math.floor(v * 255);
+      const i = (y * size + x) * 4;
+      data[i] = c; data[i+1] = c; data[i+2] = c; data[i+3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, size, size);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+const cloudShapeTex = makeCloudShapeTex();
+const cloudNoiseTex = makeCloudNoiseTex();
+
+const cloudPlane = new THREE.PlaneGeometry(1, 1);
+const cloudGeom  = new THREE.InstancedBufferGeometry();
+cloudGeom.index  = cloudPlane.index;
+cloudGeom.setAttribute('position', cloudPlane.attributes.position);
+cloudGeom.setAttribute('uv',       cloudPlane.attributes.uv);
+
+const aOffset = new Float32Array(CLOUD_COUNT * 3);
+const aScale  = new Float32Array(CLOUD_COUNT * 2);
+const aSeed   = new Float32Array(CLOUD_COUNT);
+for (let i = 0; i < CLOUD_COUNT; i++) {
+  aOffset[i*3]   = (Math.random() - 0.5) * CLOUD_FIELD;
+  aOffset[i*3+1] = CLOUD_HEIGHT + (Math.random() - 0.5) * 14;
+  aOffset[i*3+2] = (Math.random() - 0.5) * CLOUD_FIELD;
+  const w = 18 + Math.random() * 16;
+  aScale[i*2]   = w;
+  aScale[i*2+1] = w * (0.55 + Math.random() * 0.25);
+  aSeed[i] = Math.random();
+}
+cloudGeom.setAttribute('aOffset', new THREE.InstancedBufferAttribute(aOffset, 3));
+cloudGeom.setAttribute('aScale',  new THREE.InstancedBufferAttribute(aScale, 2));
+cloudGeom.setAttribute('aSeed',   new THREE.InstancedBufferAttribute(aSeed, 1));
+
+const cloudMaterial = new THREE.ShaderMaterial({
+  transparent: true,
+  depthWrite: false,
+  fog: false,
+  uniforms: {
+    uTime:      { value: 0 },
+    uShape:     { value: cloudShapeTex },
+    uNoise:     { value: cloudNoiseTex },
+    uPlayerPos: { value: new THREE.Vector3() },
+    uDriftX:    { value: 0 },
+    uDriftZ:    { value: 0 },
+    uField:     { value: CLOUD_FIELD },
+  },
+  vertexShader: `
+    attribute vec3 aOffset;
+    attribute vec2 aScale;
+    attribute float aSeed;
+    uniform vec3 uPlayerPos;
+    uniform float uDriftX;
+    uniform float uDriftZ;
+    uniform float uField;
+    varying vec2 vUv;
+    varying float vSeed;
+
+    void main() {
+      vUv = uv;
+      vSeed = aSeed;
+      // Drift in absolute world space, then wrap relative to the player so clouds
+      // are always populated near them but still move past the camera.
+      float halfField = uField * 0.5;
+      vec3 base = aOffset + vec3(uDriftX, 0.0, uDriftZ);
+      vec3 rel  = base - uPlayerPos;
+      rel.x = mod(rel.x + halfField, uField) - halfField;
+      rel.z = mod(rel.z + halfField, uField) - halfField;
+      base  = rel + uPlayerPos;
+      vec4 mv = viewMatrix * vec4(base, 1.0);
+      mv.xy += position.xy * aScale;
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: `
+    precision mediump float;
+    uniform sampler2D uShape;
+    uniform sampler2D uNoise;
+    uniform float uTime;
+    varying vec2 vUv;
+    varying float vSeed;
+
+    void main() {
+      vec2 uv = vUv;
+      // Multi-scale UV displacement (cheap stand-in for FBM3D from the original).
+      vec4 n1 = texture2D(uNoise, uv * 0.45 + vec2(uTime * 0.014, -uTime * 0.011) + vSeed);
+      uv += (n1.r - 0.5) * 0.18;
+      vec4 n2 = texture2D(uNoise, uv * 1.6 + vec2(-uTime * 0.0035, uTime * 0.0042) + vSeed * 1.7);
+      uv += (n2.r - 0.5) * 0.08;
+      float shape = texture2D(uShape, uv).r;
+      // Softness/density from a separate noise lookup (matches the original's two-texture mix).
+      vec4 nA = texture2D(uNoise, vUv * 0.7 + vec2( uTime * 0.008, -uTime * 0.011) + vSeed);
+      vec4 nB = texture2D(uNoise, vUv * 0.7 + vec2(-uTime * 0.0017, uTime * 0.0024) + vec2(0.2 + vSeed));
+      float density = smoothstep(0.18, 0.78, (nA.r + nB.r) * 0.6);
+      float alpha   = density * shape;
+      if (alpha < 0.02) discard;
+      gl_FragColor = vec4(0.97, 0.97, 0.99, alpha);
+    }
+  `,
+});
+
+const clouds = new THREE.Mesh(cloudGeom, cloudMaterial);
+clouds.frustumCulled = false;
+clouds.renderOrder = -1;  // draw before terrain so soft alpha doesn't show terrain showing through
+scene.add(clouds);
+
+// === Butterflies: fly around freely; occasionally land on a flower; flee from the duck ===
+const BUTTERFLY_COUNT     = 25;
+const BUTTERFLY_SIZE      = 0.2;
+const BUTTERFLY_SCARE     = 3.5;
+const BUTTERFLY_SPEED     = 3.0;
+const BUTTERFLY_WANDER_R  = 14;
+const BUTTERFLY_LAND_PROB = 0.45;
+const BUTTERFLY_FORCE_LAND_AFTER = 5;
+const flowerPerches = [];        // populated by the flower load callback (used by butterflies)
+const butterflyState = [];       // initialized below, regardless of flower load
+
+// Wing geometry: each wing is a fan of triangles approximating a rounded triangle (teardrop-ish).
+// Hinged on the body (x = 0). We build it from a control polygon then triangulate as a fan.
+function buildWing(side) {
+  // Polygon outline of one wing in counter-clockwise order, in the xz plane (y = 0).
+  // 'side' = -1 for left, +1 for right. Body anchor is the first vertex at x = 0.
+  const sx = side;
+  const outline = [
+    [0,           0,    0.05],
+    [sx * 0.18,   0,    0.42],
+    [sx * 0.42,   0,    0.40],
+    [sx * 0.55,   0,    0.18],
+    [sx * 0.55,   0,   -0.05],
+    [sx * 0.45,   0,   -0.28],
+    [sx * 0.22,   0,   -0.30],
+    [sx * 0.05,   0,   -0.18],
+  ];
+  // Centroid for fan-triangulation.
+  const cx = outline.reduce((a, p) => a + p[0], 0) / outline.length;
+  const cz = outline.reduce((a, p) => a + p[2], 0) / outline.length;
+  const verts = [];
+  for (let i = 0; i < outline.length; i++) {
+    const a = outline[i], b = outline[(i + 1) % outline.length];
+    // Triangle (centroid, a, b) — orient by side so normals point up consistently.
+    if (side > 0) verts.push(cx, 0, cz, a[0], 0, a[2], b[0], 0, b[2]);
+    else          verts.push(cx, 0, cz, b[0], 0, b[2], a[0], 0, a[2]);
+  }
+  return verts;
+}
+const bfPositions = new Float32Array([...buildWing(-1), ...buildWing(1)]);
+const bfGeomSrc = new THREE.BufferGeometry();
+bfGeomSrc.setAttribute('position', new THREE.BufferAttribute(bfPositions, 3));
+bfGeomSrc.computeVertexNormals();
+
+const bfGeom = new THREE.InstancedBufferGeometry();
+bfGeom.setAttribute('position', bfGeomSrc.attributes.position);
+const bfFlapPhase = new Float32Array(BUTTERFLY_COUNT);
+const bfColorAttr = new Float32Array(BUTTERFLY_COUNT * 3);
+const bfFlapRate  = new Float32Array(BUTTERFLY_COUNT);
+for (let i = 0; i < BUTTERFLY_COUNT; i++) {
+  bfFlapPhase[i] = Math.random() * Math.PI * 2;
+  bfFlapRate[i]  = 1.0;  // updated per-frame from the state machine
+  bfColorAttr[i*3] = 1; bfColorAttr[i*3+1] = 1; bfColorAttr[i*3+2] = 1;
+}
+bfGeom.setAttribute('aPhase', new THREE.InstancedBufferAttribute(bfFlapPhase, 1));
+bfGeom.setAttribute('aRate',  new THREE.InstancedBufferAttribute(bfFlapRate, 1));
+bfGeom.setAttribute('aColor', new THREE.InstancedBufferAttribute(bfColorAttr, 3));
+
+const butterflyMaterial = new THREE.ShaderMaterial({
+  side: THREE.DoubleSide,
+  uniforms: { uTime: { value: 0 } },
+  vertexShader: `
+    attribute float aPhase;
+    attribute float aRate;
+    attribute vec3 aColor;
+    uniform float uTime;
+    varying vec3 vColor;
+    varying float vWingT;
+
+    void main() {
+      vColor = aColor;
+      float flap = sin(uTime * 18.0 * aRate + aPhase) * 1.1;
+      vWingT = sin(uTime * 18.0 * aRate + aPhase) * 0.5 + 0.5;
+      float a  = flap * sign(position.x);
+      float ca = cos(a), sa = sin(a);
+      vec3 p = vec3(position.x * ca - position.y * sa,
+                    position.x * sa + position.y * ca,
+                    position.z);
+      // instanceMatrix carries world placement (position + yaw) from the CPU update.
+      gl_Position = projectionMatrix * modelViewMatrix * instanceMatrix * vec4(p, 1.0);
+    }
+  `,
+  fragmentShader: `
+    precision mediump float;
+    varying vec3 vColor;
+    varying float vWingT;
+    void main() {
+      gl_FragColor = vec4(vColor * (0.85 + 0.25 * vWingT), 1.0);
+    }
+  `,
+});
+
+const butterflies = new THREE.InstancedMesh(bfGeom, butterflyMaterial, BUTTERFLY_COUNT);
+butterflies.frustumCulled = false;
+scene.add(butterflies);
+
+// Spread butterflies in a moderate area around the spawn so several are visible immediately.
+// A large terrain-wide spread is too sparse to see any nearby. Use an absolute altitude
+// (no getTerrainHeight here — noise2D isn't initialized yet at this point in the file).
+for (let i = 0; i < BUTTERFLY_COUNT; i++) {
+  const x = (Math.random() - 0.5) * 70;
+  const z = (Math.random() - 0.5) * 70;
+  const y = 9 + Math.random() * 2;  // start safely above tallest terrain (~7); they descend on first wander
+  butterflyState.push({
+    mode: 'flying',
+    pos:    new THREE.Vector3(x, y, z),
+    target: new THREE.Vector3(x, y, z),
+    yaw: Math.random() * Math.PI * 2,
+    sitTimer: 0,
+    sinceLanded: 0,
+    landingIdx: -1,
+  });
+}
+function initButterflies() { /* flowers loaded — used as targets in pickButterflyTarget */ }
+
+function pickButterflyTarget(b) {
+  // Force a landing if the butterfly hasn't landed in a while, otherwise random chance.
+  const wantsLand = flowerPerches.length > 0 &&
+    (b.sinceLanded > BUTTERFLY_FORCE_LAND_AFTER || Math.random() < BUTTERFLY_LAND_PROB);
+  if (wantsLand) {
+    for (let k = 0; k < 8; k++) {
+      const idx = Math.floor(Math.random() * flowerPerches.length);
+      const fp  = flowerPerches[idx];
+      const dx  = fp.x - player.position.x, dz = fp.z - player.position.z;
+      const d2  = dx*dx + dz*dz;
+      // Skip flowers right next to the duck, but allow ones in walking distance so it's visible.
+      if (d2 > BUTTERFLY_SCARE * BUTTERFLY_SCARE && d2 < 25 * 25) {
+        b.target.copy(fp);
+        b.landingIdx = idx;
+        return;
+      }
+    }
+  }
+  // Wander relative to the butterfly's own position so each one stays in its area.
+  const tx = b.pos.x + (Math.random() - 0.5) * BUTTERFLY_WANDER_R;
+  const tz = b.pos.z + (Math.random() - 0.5) * BUTTERFLY_WANDER_R;
+  const ty = getTerrainHeight(tx, tz) + 1.4 + Math.random() * 2.0;
+  b.target.set(tx, ty, tz);
+  b.landingIdx = -1;
+}
+
+const _bfMat   = new THREE.Matrix4();
+const _bfQuat  = new THREE.Quaternion();
+const _bfUp    = new THREE.Vector3(0, 1, 0);
+const _bfScl   = new THREE.Vector3(BUTTERFLY_SIZE, BUTTERFLY_SIZE, BUTTERFLY_SIZE);
+const _bfDir   = new THREE.Vector3();
+function updateButterflies(dt, t) {
+  for (let i = 0; i < butterflyState.length; i++) {
+    const b = butterflyState[i];
+
+    if (b.mode === 'sitting') {
+      bfFlapRate[i] = 0.15;
+      const dx = b.pos.x - player.position.x;
+      const dz = b.pos.z - player.position.z;
+      const scared = dx*dx + dz*dz < BUTTERFLY_SCARE * BUTTERFLY_SCARE;
+      b.sitTimer -= dt;
+      if (scared || b.sitTimer <= 0) {
+        b.mode = 'flying';
+        b.sinceLanded = 0;  // reset hunger-for-flowers counter when leaving a perch
+        pickButterflyTarget(b);
+      } else {
+        b.pos.y = b.target.y + Math.sin(t * 1.5 + i) * 0.02;
+      }
+    } else {  // flying
+      bfFlapRate[i] = 1.4;
+      b.sinceLanded += dt;
+      _bfDir.subVectors(b.target, b.pos);
+      const dist = _bfDir.length();
+      if (dist < 0.6) {
+        if (b.landingIdx >= 0) {
+          b.pos.copy(b.target);
+          b.mode = 'sitting';
+          b.sitTimer = 4 + Math.random() * 4;  // 4-8 seconds
+        } else {
+          pickButterflyTarget(b);
+        }
+      } else {
+        _bfDir.multiplyScalar(BUTTERFLY_SPEED * dt / dist);
+        b.pos.add(_bfDir);
+        b.pos.y += Math.sin(t * 6 + i) * 0.015;
+        b.yaw = Math.atan2(b.target.x - b.pos.x, b.target.z - b.pos.z);
+      }
+    }
+
+    _bfQuat.setFromAxisAngle(_bfUp, b.yaw);
+    _bfMat.compose(b.pos, _bfQuat, _bfScl);
+    butterflies.setMatrixAt(i, _bfMat);
+  }
+  butterflies.instanceMatrix.needsUpdate = true;
+  bfGeom.attributes.aRate.needsUpdate = true;
+}
+
 const noise2D = createNoise2D();
 const TERRAIN_SIZE = 240;
 const TERRAIN_SEGMENTS = 220;
@@ -401,6 +731,14 @@ new GLTFLoader().load('flower.glb', (gltf) => {
   const minY = flowerBbox.min.y;
   const flowerHeightRange = Math.max(0.001, flowerBbox.max.y - flowerBbox.min.y);
 
+  // Expose flower top positions so butterflies can perch on them.
+  for (const m of transforms) {
+    const p = new THREE.Vector3().setFromMatrixPosition(m);
+    const s = m.elements[0];  // uniform scale
+    flowerPerches.push(new THREE.Vector3(p.x, p.y + flowerBbox.max.y * s + 0.05, p.z));
+  }
+  initButterflies();
+
   for (const { material, geometry } of merged) {
     const tintable = isPetalMat(material);
     const mat = material.clone();
@@ -583,6 +921,14 @@ function animate() {
   sun.position.set(player.position.x + 50, player.position.y + 80, player.position.z + 30);
   sun.target.position.copy(player.position);
   sun.target.updateMatrixWorld();
+
+  cloudMaterial.uniforms.uTime.value   = totalElapsed;
+  cloudMaterial.uniforms.uDriftX.value = totalElapsed * 3.0;
+  cloudMaterial.uniforms.uDriftZ.value = totalElapsed * 0.8;
+  cloudMaterial.uniforms.uPlayerPos.value.copy(player.position);
+
+  butterflyMaterial.uniforms.uTime.value = totalElapsed;
+  updateButterflies(dt, totalElapsed);
 
   if (mixer) {
     mixer.update(dt);
