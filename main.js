@@ -32,6 +32,19 @@ s.left = -25; s.right = 25; s.top = 25; s.bottom = -25; s.near = 1; s.far = 200;
 scene.add(sun);
 scene.add(sun.target);  // sun follows player so the small shadow frustum always covers them
 
+// === Pond placement constants (declared early so every scatter system can exclude
+// the pond's footprint). Heights/floors stay near getTerrainHeight further down.
+const POND_X           = 0;
+const POND_Z           = 0;
+const POND_RADIUS      = 14;
+const POND_FALLOFF     = 6;
+const POND_DISC_RADIUS = POND_RADIUS + POND_FALLOFF;  // visible water disc radius
+function isInPond(x, z, pad = 0) {
+  const dx = x - POND_X, dz = z - POND_Z;
+  const r  = POND_DISC_RADIUS + pad;
+  return dx*dx + dz*dz < r*r;
+}
+
 // === Stars: a hemisphere of points, made visible only at night and parented to player ===
 const STAR_COUNT  = 2200;
 const STAR_RADIUS = 240;  // just past fog's day-far so they hide nicely behind day fog
@@ -322,8 +335,11 @@ scene.add(butterflies);
 // A large terrain-wide spread is too sparse to see any nearby. Use an absolute altitude
 // (no getTerrainHeight here — noise2D isn't initialized yet at this point in the file).
 for (let i = 0; i < BUTTERFLY_COUNT; i++) {
-  const x = (Math.random() - 0.5) * 70;
-  const z = (Math.random() - 0.5) * 70;
+  let x, z;
+  do {
+    x = (Math.random() - 0.5) * 70;
+    z = (Math.random() - 0.5) * 70;
+  } while (isInPond(x, z, 1));
   const y = 9 + Math.random() * 2;  // start safely above tallest terrain (~7); they descend on first wander
   butterflyState.push({
     mode: 'flying',
@@ -356,8 +372,13 @@ function pickButterflyTarget(b) {
     }
   }
   // Wander relative to the butterfly's own position so each one stays in its area.
-  const tx = b.pos.x + (Math.random() - 0.5) * BUTTERFLY_WANDER_R;
-  const tz = b.pos.z + (Math.random() - 0.5) * BUTTERFLY_WANDER_R;
+  // Try a few times to avoid landing the target over the pond.
+  let tx, tz;
+  for (let k = 0; k < 6; k++) {
+    tx = b.pos.x + (Math.random() - 0.5) * BUTTERFLY_WANDER_R;
+    tz = b.pos.z + (Math.random() - 0.5) * BUTTERFLY_WANDER_R;
+    if (!isInPond(tx, tz, 2)) break;
+  }
   const ty = getTerrainHeight(tx, tz) + 1.4 + Math.random() * 2.0;
   b.target.set(tx, ty, tz);
   b.landingIdx = -1;
@@ -425,8 +446,11 @@ for (let i = 0; i < FIREFLY_COUNT; i++) {
   // Initial spawn: spread around the duck's spawn area, low-altitude. Will hop to
   // terrain-relative targets once getTerrainHeight is available (it isn't in this
   // section's lexical position, but the wander loop runs in animate()).
-  const x = (Math.random() - 0.5) * 60;
-  const z = (Math.random() - 0.5) * 60;
+  let x, z;
+  do {
+    x = (Math.random() - 0.5) * 60;
+    z = (Math.random() - 0.5) * 60;
+  } while (isInPond(x, z, 1));
   const y = 1.5 + Math.random() * 1.0;
   fireflyState.push({
     pos:    new THREE.Vector3(x, y, z),
@@ -489,8 +513,12 @@ function updateFireflies(dt, t) {
     const dist = _ffDir.length();
     if (dist < 0.35) {
       // Pick a new wander target near the firefly's own position, hovering low above terrain.
-      const tx = f.pos.x + (Math.random() - 0.5) * FIREFLY_WANDER_R;
-      const tz = f.pos.z + (Math.random() - 0.5) * FIREFLY_WANDER_R;
+      let tx, tz;
+      for (let k = 0; k < 6; k++) {
+        tx = f.pos.x + (Math.random() - 0.5) * FIREFLY_WANDER_R;
+        tz = f.pos.z + (Math.random() - 0.5) * FIREFLY_WANDER_R;
+        if (!isInPond(tx, tz, 1)) break;
+      }
       const ty = getTerrainHeight(tx, tz) + 0.6 + Math.random() * 1.6;
       f.target.set(tx, ty, tz);
     } else {
@@ -511,10 +539,50 @@ const TERRAIN_SIZE = 240;
 const TERRAIN_SEGMENTS = 220;
 const HEIGHT_SCALE = 7;
 
+// Pond shape (placement constants are defined near the top of the file). Three
+// concentric zones make the bowl symmetric regardless of natural noise:
+//   [0, RADIUS]                                    → flat basin floor at POND_BOTTOM
+//   [RADIUS, RADIUS+FALLOFF]                       → smooth wall up to POND_RIM_HEIGHT
+//   [RADIUS+FALLOFF, RADIUS+FALLOFF+RIM_BLEND]     → blend rim height into natural noise
+//   [> outer]                                      → pure natural noise
+const POND_BOTTOM     = -7.0;   // basin floor height (deep)
+const POND_RIM_HEIGHT = 1.0;    // height of the lip around the pond, above water
+const POND_RIM_BLEND  = 9;      // smooth blend from rim back into natural terrain
+const POND_WATER_Y    = -0.4;   // water surface (between rim and basin floor)
+const DUCK_SUBMERGE_DEPTH = 0.55;  // surface-bob depth — only the head shows
+
+function _smoothstep(a, b, x) {
+  const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
 function getTerrainHeight(x, z) {
   const n = noise2D(x * 0.010, z * 0.010) * 0.8
           + noise2D(x * 0.035, z * 0.035) * 0.2;
-  return n * HEIGHT_SCALE;
+  const naturalH = n * HEIGHT_SCALE;
+  const dx = x - POND_X, dz = z - POND_Z;
+  const dist = Math.sqrt(dx*dx + dz*dz);
+
+  if (dist <= POND_RADIUS) {
+    return POND_BOTTOM;
+  }
+  if (dist <= POND_RADIUS + POND_FALLOFF) {
+    const t = _smoothstep(POND_RADIUS, POND_RADIUS + POND_FALLOFF, dist);
+    return POND_BOTTOM + (POND_RIM_HEIGHT - POND_BOTTOM) * t;
+  }
+  if (dist <= POND_RADIUS + POND_FALLOFF + POND_RIM_BLEND) {
+    const t = _smoothstep(POND_RADIUS + POND_FALLOFF, POND_RADIUS + POND_FALLOFF + POND_RIM_BLEND, dist);
+    return POND_RIM_HEIGHT + (naturalH - POND_RIM_HEIGHT) * t;
+  }
+  return naturalH;
+}
+
+// Walkable height. Inside the pond's water column the duck floats half-submerged
+// so only the head pokes above the surface.
+function getWalkableY(x, z) {
+  const tY = getTerrainHeight(x, z);
+  if (isInPond(x, z) && tY < POND_WATER_Y) return POND_WATER_Y - DUCK_SUBMERGE_DEPTH;
+  return tY;
 }
 
 const terrainGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGMENTS, TERRAIN_SEGMENTS);
@@ -543,6 +611,163 @@ const terrain = new THREE.Mesh(
 );
 terrain.receiveShadow = true;
 scene.add(terrain);
+
+// === Pond water surface (cheap MeshStandardMaterial with vertex-shader ripples) ===
+// Disc extends to where the basin meets undisturbed ground so the edge is hidden.
+const pondGeom = new THREE.CircleGeometry(POND_RADIUS + POND_FALLOFF, 96);
+pondGeom.rotateX(-Math.PI / 2);
+const pondMaterial = new THREE.MeshStandardMaterial({
+  color:       0x2a6e93,
+  metalness:   0.0,
+  roughness:   0.55,
+  transparent: true,
+  opacity:     0.92,
+});
+pondMaterial.onBeforeCompile = (shader) => {
+  shader.uniforms.uTime = windUniform;  // shared wind clock
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', `#include <common>
+      uniform float uTime;`)
+    .replace('#include <begin_vertex>', `
+      vec3 transformed = vec3(position);
+      transformed.y += sin(transformed.x * 0.55 + uTime * 1.3) * 0.05
+                     + cos(transformed.z * 0.7  + uTime * 1.1) * 0.05;`);
+};
+const pond = new THREE.Mesh(pondGeom, pondMaterial);
+pond.position.set(POND_X, POND_WATER_Y, POND_Z);
+pond.receiveShadow = true;
+scene.add(pond);
+
+// === Fish: swim in the pond, jump above the surface periodically. Always rendered;
+// the opaque water plane hides them from above except during a jump arc. ===
+const FISH_COUNT = 8;
+// Body + tail must share indexing for mergeGeometries to work — IcosahedronGeometry
+// is non-indexed but ConeGeometry is indexed by default, so toNonIndexed() both.
+const _fishBody = new THREE.IcosahedronGeometry(0.5, 1).toNonIndexed();
+_fishBody.scale(0.42, 0.3, 0.85);
+const _fishTail = new THREE.ConeGeometry(0.18, 0.34, 4, 1).toNonIndexed();
+_fishTail.rotateX(-Math.PI / 2);   // tip trails behind the +z head
+_fishTail.translate(0, 0, -0.55);
+const fishGeom = mergeGeometries([_fishBody, _fishTail]);
+const fishMaterial = new THREE.MeshStandardMaterial({
+  color:     0xff8a3a,
+  roughness: 0.55,
+  metalness: 0.10,
+});
+const fishes = new THREE.InstancedMesh(fishGeom, fishMaterial, FISH_COUNT);
+fishes.frustumCulled = false;
+fishes.castShadow    = false;
+scene.add(fishes);
+
+const fishState = [];
+{
+  const tmpColor = new THREE.Color();
+  for (let i = 0; i < FISH_COUNT; i++) {
+    const r = Math.random() * (POND_RADIUS - 3);
+    const a = Math.random() * Math.PI * 2;
+    fishState.push({
+      mode:   'swim',
+      swimX:  POND_X + Math.cos(a) * r,
+      swimZ:  POND_Z + Math.sin(a) * r,
+      swimY:  POND_BOTTOM + 0.4 + Math.random() * 1.4,
+      yaw:    Math.random() * Math.PI * 2,
+      targetX: 0, targetZ: 0, targetY: 0,
+      jumpT: 0, jumpDur: 0, jumpH: 0,
+      jumpYaw: 0, jumpSpeed: 0,
+      jumpStartX: 0, jumpStartZ: 0,
+      nextJumpDelay: 1 + Math.random() * 6,
+    });
+    tmpColor.setHSL(0.04 + Math.random() * 0.06, 0.85, 0.55);
+    fishes.setColorAt(i, tmpColor);
+  }
+}
+if (fishes.instanceColor) fishes.instanceColor.needsUpdate = true;
+
+function pickFishSwimTarget(f) {
+  const r = Math.random() * (POND_RADIUS - 2.5);
+  const a = Math.random() * Math.PI * 2;
+  f.targetX = POND_X + Math.cos(a) * r;
+  f.targetZ = POND_Z + Math.sin(a) * r;
+  f.targetY = POND_BOTTOM + 0.4 + Math.random() * 1.4;
+}
+for (const f of fishState) pickFishSwimTarget(f);
+
+const _fishMat = new THREE.Matrix4();
+const _fishPos = new THREE.Vector3();
+const _fishQuat = new THREE.Quaternion();
+const _fishScl = new THREE.Vector3(1, 1, 1);
+const _fishEul = new THREE.Euler();
+const FISH_SWIM_SPEED = 1.2;
+
+function updateFish(dt) {
+  for (let i = 0; i < fishState.length; i++) {
+    const f = fishState[i];
+    let pitch = 0;
+
+    if (f.mode === 'jump') {
+      f.jumpT += dt;
+      if (f.jumpT >= f.jumpDur) {
+        // splashdown — turn around, resume swimming, schedule next jump
+        let landX = f.jumpStartX + Math.sin(f.jumpYaw) * f.jumpSpeed * f.jumpDur;
+        let landZ = f.jumpStartZ + Math.cos(f.jumpYaw) * f.jumpSpeed * f.jumpDur;
+        const dx = landX - POND_X, dz = landZ - POND_Z;
+        const r  = Math.sqrt(dx*dx + dz*dz);
+        if (r > POND_RADIUS - 2) {
+          landX = POND_X + (dx / r) * (POND_RADIUS - 2);
+          landZ = POND_Z + (dz / r) * (POND_RADIUS - 2);
+        }
+        f.swimX = landX; f.swimZ = landZ;
+        f.swimY = POND_BOTTOM + 0.6;
+        f.yaw   = f.jumpYaw + Math.PI;
+        f.mode  = 'swim';
+        f.nextJumpDelay = 5 + Math.random() * 12;
+        pickFishSwimTarget(f);
+      } else {
+        const tN = f.jumpT / f.jumpDur;
+        const y  = POND_WATER_Y + 4 * f.jumpH * tN * (1 - tN);
+        const dy = 4 * f.jumpH * (1 - 2 * tN) / f.jumpDur;
+        const x  = f.jumpStartX + Math.sin(f.jumpYaw) * f.jumpSpeed * f.jumpT;
+        const z  = f.jumpStartZ + Math.cos(f.jumpYaw) * f.jumpSpeed * f.jumpT;
+        _fishPos.set(x, y, z);
+        f.yaw  = f.jumpYaw;
+        // Pitch: head up while rising, down while falling
+        pitch = -Math.atan2(dy, f.jumpSpeed);
+      }
+    }
+    if (f.mode === 'swim') {
+      const dxT = f.targetX - f.swimX;
+      const dzT = f.targetZ - f.swimZ;
+      const dyT = f.targetY - f.swimY;
+      const dist = Math.sqrt(dxT*dxT + dzT*dzT);
+      if (dist < 0.6) {
+        pickFishSwimTarget(f);
+      } else {
+        f.swimX += (dxT / dist) * FISH_SWIM_SPEED * dt;
+        f.swimZ += (dzT / dist) * FISH_SWIM_SPEED * dt;
+        f.swimY += dyT * 0.6 * dt;
+        f.yaw   = Math.atan2(dxT, dzT);
+      }
+      _fishPos.set(f.swimX, f.swimY, f.swimZ);
+      f.nextJumpDelay -= dt;
+      if (f.nextJumpDelay <= 0) {
+        f.mode      = 'jump';
+        f.jumpT     = 0;
+        f.jumpDur   = 0.7 + Math.random() * 0.5;
+        f.jumpH     = 1.0 + Math.random() * 1.4;
+        f.jumpYaw   = Math.random() * Math.PI * 2;
+        f.jumpSpeed = 0.8 + Math.random() * 1.4;
+        f.jumpStartX = f.swimX;
+        f.jumpStartZ = f.swimZ;
+      }
+    }
+
+    _fishEul.set(pitch, f.yaw, 0, 'YXZ');
+    _fishQuat.setFromEuler(_fishEul);
+    _fishMat.compose(_fishPos, _fishQuat, _fishScl);
+    fishes.setMatrixAt(i, _fishMat);
+  }
+  fishes.instanceMatrix.needsUpdate = true;
+}
 
 // === Trees: ez-tree (procedural, runtime). Generate a few unique variants, instance the rest. ===
 const TREE_COUNT    = 300;
@@ -678,7 +903,7 @@ if (treeFlowerMats.length > 0) {
 }
 
 // === Animated grass (al-ro slerp wind + FluffyGrass tip-color & height variation) ===
-const GRASS_COUNT  = 500000;
+const GRASS_COUNT  = 220000;
 const BLADE_WIDTH  = 0.07;
 const BLADE_HEIGHT = 0.09;
 const BLADE_JOINTS = 3;
@@ -728,8 +953,12 @@ const mulQ = (a, b) => new THREE.Vector4(
 const TILT_MIN = -0.25, TILT_MAX = 0.25;
 let qY = new THREE.Vector4(), qX = new THREE.Vector4(), qZ = new THREE.Vector4();
 for (let i = 0; i < GRASS_COUNT; i++) {
-  const x = (Math.random() - 0.5) * (TERRAIN_SIZE - 20);
-  const z = (Math.random() - 0.5) * (TERRAIN_SIZE - 20);
+  let x, z;
+  // Re-roll if we'd land in the pond — grass under the water surface is wasted work.
+  do {
+    x = (Math.random() - 0.5) * (TERRAIN_SIZE - 20);
+    z = (Math.random() - 0.5) * (TERRAIN_SIZE - 20);
+  } while (isInPond(x, z, 1));
   const y = getTerrainHeight(x, z);
   offsets[i*3] = x; offsets[i*3+1] = y; offsets[i*3+2] = z;
 
@@ -910,8 +1139,11 @@ new GLTFLoader().load('flower.glb', (gltf) => {
   const tmpQuat = new THREE.Quaternion();
   const upAxis  = new THREE.Vector3(0, 1, 0);
   for (let c = 0; c < FLOWER_CLUSTERS; c++) {
-    const cx = (Math.random() - 0.5) * (TERRAIN_SIZE - 20);
-    const cz = (Math.random() - 0.5) * (TERRAIN_SIZE - 20);
+    let cx, cz;
+    do {
+      cx = (Math.random() - 0.5) * (TERRAIN_SIZE - 20);
+      cz = (Math.random() - 0.5) * (TERRAIN_SIZE - 20);
+    } while (isInPond(cx, cz, 1.5));
     const groupSize = 1 + Math.floor(Math.random() * 3);
     const angleStart = Math.random() * Math.PI * 2;  // rotate the whole cluster
     for (let k = 0; k < groupSize; k++) {
@@ -1075,7 +1307,12 @@ new GLTFLoader().load(
   () => console.warn('duck.glb not found yet — using placeholder cube. Drop your exported file in next to index.html.')
 );
 
-player.position.set(0, getTerrainHeight(0, 0), 0);
+// Spawn well outside the pond's full influence zone so the duck doesn't appear in the water.
+{
+  const sx = POND_X + POND_RADIUS + POND_FALLOFF + POND_RIM_BLEND + 4;
+  const sz = POND_Z;
+  player.position.set(sx, getWalkableY(sx, sz), sz);
+}
 
 const keys = {};
 addEventListener('keydown', (e) => keys[e.code] = true);
@@ -1162,6 +1399,7 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyL') { lightOn = !lightOn; applyLight(); }
 });
 
+
 function applyDayNight() {
   if (isNight) {
     scene.background.set(0x07091a);
@@ -1179,6 +1417,7 @@ function applyDayNight() {
     fireflies.visible = true;
     butterflies.visible = false;  // butterflies sleep at night
     clouds.visible = false;       // day clouds look weird against the dark sky
+    pond.material.color.setHex(0x0d2d44);  // dark moonlit pond
   } else {
     scene.background.set(0x87ceeb);
     scene.fog.color.set(0xb8d8ee);
@@ -1195,6 +1434,7 @@ function applyDayNight() {
     fireflies.visible = false;
     butterflies.visible = true;
     clouds.visible = true;
+    pond.material.color.setHex(0x2a6e93);
   }
   toggleBtn.textContent = isNight ? 'Day' : 'Night';
   applyLight();  // light is only on when night && user-toggle on
@@ -1281,7 +1521,7 @@ function animate() {
   }
 
   if (climbState === 'normal') {
-    player.position.y = getTerrainHeight(player.position.x, player.position.z);
+    player.position.y = getWalkableY(player.position.x, player.position.z);
   } else if (climbState === 'up' || climbState === 'down') {
     climbT += dt / CLIMB_DURATION;
     const tt = Math.min(1, climbT);
@@ -1302,6 +1542,7 @@ function animate() {
 
   butterflyMaterial.uniforms.uTime.value = totalElapsed;
   if (!isNight) updateButterflies(dt, totalElapsed);
+  updateFish(dt);
 
   // Stars + fireflies: keep time uniforms ticking so they don't pop when toggled on,
   // but skip the firefly wander update during the day (cheap, but no point doing it).
