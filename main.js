@@ -21,7 +21,8 @@ scene.fog = new THREE.Fog(0xb8d8ee, 120, 320);
 
 const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
 
-scene.add(new THREE.HemisphereLight(0xbcdfff, 0x4a5530, 1.1));
+const hemi = new THREE.HemisphereLight(0xbcdfff, 0x4a5530, 1.1);
+scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff2cc, 3.2);
 sun.position.set(50, 80, 30);
 sun.castShadow = true;
@@ -30,6 +31,58 @@ const s = sun.shadow.camera;
 s.left = -25; s.right = 25; s.top = 25; s.bottom = -25; s.near = 1; s.far = 200;
 scene.add(sun);
 scene.add(sun.target);  // sun follows player so the small shadow frustum always covers them
+
+// === Stars: a hemisphere of points, made visible only at night and parented to player ===
+const STAR_COUNT  = 2200;
+const STAR_RADIUS = 240;  // just past fog's day-far so they hide nicely behind day fog
+const starPos = new Float32Array(STAR_COUNT * 3);
+const starSize = new Float32Array(STAR_COUNT);
+for (let i = 0; i < STAR_COUNT; i++) {
+  const phi      = Math.random() * Math.PI * 2;
+  const cosTheta = Math.pow(Math.random(), 0.7);  // bias toward zenith so it looks like a dome
+  const sinTheta = Math.sqrt(1 - cosTheta * cosTheta);
+  starPos[i*3]   = STAR_RADIUS * sinTheta * Math.cos(phi);
+  starPos[i*3+1] = STAR_RADIUS * cosTheta;
+  starPos[i*3+2] = STAR_RADIUS * sinTheta * Math.sin(phi);
+  starSize[i]    = 0.8 + Math.random() * 1.6;
+}
+const starGeom = new THREE.BufferGeometry();
+starGeom.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+starGeom.setAttribute('aSize',    new THREE.BufferAttribute(starSize, 1));
+
+const starMaterial = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 } },
+  transparent: true,
+  depthWrite: false,
+  fog: false,  // ShaderMaterial ignores fog by default — explicit for clarity
+  vertexShader: `
+    attribute float aSize;
+    uniform float uTime;
+    varying float vTwinkle;
+    void main() {
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      // Cheap per-star twinkle from a hash of position.
+      float h = fract(sin(dot(position, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+      vTwinkle = 0.6 + 0.4 * sin(uTime * 2.0 + h * 6.283);
+      gl_PointSize = aSize * vTwinkle * 1.4;
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: `
+    varying float vTwinkle;
+    void main() {
+      vec2 c = gl_PointCoord - 0.5;
+      float r = length(c);
+      if (r > 0.5) discard;
+      float a = smoothstep(0.5, 0.0, r);
+      gl_FragColor = vec4(vec3(1.0, 0.97, 0.85) * vTwinkle, a);
+    }
+  `,
+});
+const stars = new THREE.Points(starGeom, starMaterial);
+stars.frustumCulled = false;
+stars.visible = false;
+scene.add(stars);
 
 // === Clouds: ported from dghez/THREEJS_Procedural-clouds — billboard planes with FBM-displaced
 // alpha. Uses procedurally-built shape + noise textures (no external image assets).
@@ -361,6 +414,98 @@ function updateButterflies(dt, t) {
   bfGeom.attributes.aRate.needsUpdate = true;
 }
 
+// === Fireflies: night-time wandering points (additive glow) ===
+const FIREFLY_COUNT = 450;
+const FIREFLY_SPEED = 1.6;
+const FIREFLY_WANDER_R = 6;
+const fireflyState = [];
+const ffPositions = new Float32Array(FIREFLY_COUNT * 3);
+const ffPhases    = new Float32Array(FIREFLY_COUNT);
+for (let i = 0; i < FIREFLY_COUNT; i++) {
+  // Initial spawn: spread around the duck's spawn area, low-altitude. Will hop to
+  // terrain-relative targets once getTerrainHeight is available (it isn't in this
+  // section's lexical position, but the wander loop runs in animate()).
+  const x = (Math.random() - 0.5) * 60;
+  const z = (Math.random() - 0.5) * 60;
+  const y = 1.5 + Math.random() * 1.0;
+  fireflyState.push({
+    pos:    new THREE.Vector3(x, y, z),
+    target: new THREE.Vector3(x, y, z),
+    phase:  Math.random() * Math.PI * 2,
+  });
+  ffPositions[i*3] = x; ffPositions[i*3+1] = y; ffPositions[i*3+2] = z;
+  ffPhases[i] = fireflyState[i].phase;
+}
+
+const ffGeom = new THREE.BufferGeometry();
+ffGeom.setAttribute('position', new THREE.BufferAttribute(ffPositions, 3));
+ffGeom.setAttribute('aPhase',   new THREE.BufferAttribute(ffPhases, 1));
+
+const fireflyMaterial = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 } },
+  transparent: true,
+  depthWrite: false,
+  blending: THREE.AdditiveBlending,
+  vertexShader: `
+    attribute float aPhase;
+    uniform float uTime;
+    varying float vGlow;
+    void main() {
+      // Asymmetric pulse: bright burst, slower fade — feels like a firefly.
+      float s = sin(uTime * 3.2 + aPhase) * 0.5 + 0.5;
+      float pulse = pow(s, 2.0);
+      vGlow = pulse;
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      // Tiny dots: small base size, modest grow on the bright phase.
+      gl_PointSize = (1.2 + 3.5 * pulse) * (90.0 / -mv.z);
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: `
+    varying float vGlow;
+    void main() {
+      vec2 c = gl_PointCoord - 0.5;
+      float r = length(c);
+      if (r > 0.5) discard;
+      float a = smoothstep(0.5, 0.0, r);
+      // Pure green; the bright phase nudges to a slightly yellow-green core.
+      vec3 col = mix(vec3(0.05, 0.55, 0.08), vec3(0.55, 1.0, 0.35), vGlow);
+      gl_FragColor = vec4(col, a * (0.05 + vGlow));
+    }
+  `,
+});
+const fireflies = new THREE.Points(ffGeom, fireflyMaterial);
+fireflies.frustumCulled = false;
+fireflies.visible = false;
+scene.add(fireflies);
+
+const _ffDir = new THREE.Vector3();
+function updateFireflies(dt, t) {
+  const posAttr = ffGeom.attributes.position;
+  const arr = posAttr.array;
+  for (let i = 0; i < fireflyState.length; i++) {
+    const f = fireflyState[i];
+    _ffDir.subVectors(f.target, f.pos);
+    const dist = _ffDir.length();
+    if (dist < 0.35) {
+      // Pick a new wander target near the firefly's own position, hovering low above terrain.
+      const tx = f.pos.x + (Math.random() - 0.5) * FIREFLY_WANDER_R;
+      const tz = f.pos.z + (Math.random() - 0.5) * FIREFLY_WANDER_R;
+      const ty = getTerrainHeight(tx, tz) + 0.6 + Math.random() * 1.6;
+      f.target.set(tx, ty, tz);
+    } else {
+      _ffDir.multiplyScalar(FIREFLY_SPEED * dt / dist);
+      f.pos.add(_ffDir);
+      // Tiny vertical bobble so they don't look like they're on rails.
+      f.pos.y += Math.sin(t * 3 + i * 0.7) * 0.012;
+    }
+    arr[i*3]   = f.pos.x;
+    arr[i*3+1] = f.pos.y;
+    arr[i*3+2] = f.pos.z;
+  }
+  posAttr.needsUpdate = true;
+}
+
 const noise2D = createNoise2D();
 const TERRAIN_SIZE = 240;
 const TERRAIN_SEGMENTS = 220;
@@ -623,6 +768,7 @@ const grassMaterial = new THREE.ShaderMaterial({
     uNoiseTex:    { value: grassNoiseTex },
     uNoiseScale:  { value: 1.5 },
     uTerrainSize: { value: TERRAIN_SIZE },
+    uColorMult:   { value: 1.0 },  // 1 by day, ~0.3 at night to dim the saturated tip colors
   },
   vertexShader: `
     precision mediump float;
@@ -708,6 +854,7 @@ const grassMaterial = new THREE.ShaderMaterial({
     uniform vec3 tipColor2;
     uniform sampler2D uNoiseTex;
     uniform float uNoiseScale;
+    uniform float uColorMult;
     varying vec2 vUv;
     varying vec2 vGlobalUV;
     varying float frc;
@@ -720,7 +867,7 @@ const grassMaterial = new THREE.ShaderMaterial({
       // FluffyGrass-style tip variation: two tip colours mixed by a world-space noise sample.
       float colorN = texture2D(uNoiseTex, vGlobalUV * uNoiseScale).r;
       vec3 tip = mix(tipColor1, tipColor2, colorN);
-      vec3 col = mix(bottomColor, tip, frc);
+      vec3 col = mix(bottomColor, tip, frc) * uColorMult;
       gl_FragColor = vec4(col, 1.0);
       #include <tonemapping_fragment>
       #include <colorspace_fragment>
@@ -846,6 +993,40 @@ new GLTFLoader().load('flower.glb', (gltf) => {
 }, undefined, () => console.warn('flower.glb not found'));
 
 const player = new THREE.Group();
+
+// Duck lantern: warm golden point light + visible flame sprite, positioned where
+// the duck would hold a lantern (slightly forward, off to the side, at body height).
+// Player forward is +Z, so x=side, z=forward in player-local space.
+const LANTERN_POS = new THREE.Vector3(0.3, 0.5, 0.45);
+const LANTERN_COLOR = 0xffb84a;  // saturated warm gold
+
+const duckGlow = new THREE.PointLight(LANTERN_COLOR, 0.0, 14, 1.6);
+duckGlow.position.copy(LANTERN_POS);
+duckGlow.castShadow = false;
+player.add(duckGlow);
+
+function makeLanternFlameTexture(size = 128) {
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+  g.addColorStop(0,    'rgba(255, 235, 170, 1.00)');
+  g.addColorStop(0.30, 'rgba(255, 195, 100, 0.65)');
+  g.addColorStop(1,    'rgba(255, 160,  50, 0.00)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  return new THREE.CanvasTexture(c);
+}
+const duckHalo = new THREE.Sprite(new THREE.SpriteMaterial({
+  map:        makeLanternFlameTexture(),
+  blending:   THREE.AdditiveBlending,
+  depthWrite: false,
+  transparent: true,
+}));
+duckHalo.scale.set(1.0, 1.0, 1);  // small lantern-flame sized halo
+duckHalo.position.copy(LANTERN_POS);
+duckHalo.visible = false;
+player.add(duckHalo);
 scene.add(player);
 
 const placeholder = new THREE.Mesh(
@@ -942,6 +1123,86 @@ let climbT      = 0;
 let prevSpace   = false;
 const climbStart  = new THREE.Vector3();
 const climbTarget = new THREE.Vector3();
+
+// === Day / Night toggle ===
+// Captures all of the day-time look so we can swap between them. Anything that should
+// look different at night flips here; per-frame updates further down only run for the
+// active mode (e.g. fireflies don't wander while it's day).
+let isNight = false;
+let lightOn = true;
+const buttonStyle = `
+  position: fixed; right: 12px;
+  padding: 8px 14px;
+  font: 14px/1 -apple-system, system-ui, sans-serif;
+  background: rgba(0,0,0,0.45);
+  color: #fff;
+  border: 1px solid rgba(255,255,255,0.25);
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+`;
+const toggleBtn = document.createElement('button');
+toggleBtn.textContent = 'Night';
+toggleBtn.style.cssText = buttonStyle + 'top: 12px;';
+document.body.appendChild(toggleBtn);
+
+const lightBtn = document.createElement('button');
+lightBtn.textContent = 'Light: On';
+lightBtn.style.cssText = buttonStyle + 'top: 52px;';
+document.body.appendChild(lightBtn);
+
+function applyLight() {
+  const on = isNight && lightOn;
+  duckGlow.intensity   = on ? 6.0 : 0.0;
+  duckHalo.visible     = on;
+  lightBtn.textContent = lightOn ? 'Light: On' : 'Light: Off';
+}
+lightBtn.addEventListener('click', () => { lightOn = !lightOn; applyLight(); });
+addEventListener('keydown', (e) => {
+  if (e.code === 'KeyL') { lightOn = !lightOn; applyLight(); }
+});
+
+function applyDayNight() {
+  if (isNight) {
+    scene.background.set(0x07091a);
+    scene.fog.color.set(0x0a0e22);
+    scene.fog.near = 60;
+    scene.fog.far  = 200;
+    hemi.color.set(0x2a3a66);
+    hemi.groundColor.set(0x101830);
+    hemi.intensity = 0.35;
+    sun.color.set(0x9fb6e6);  // moonlight tint
+    sun.intensity = 0.6;
+    renderer.toneMappingExposure = 0.78;
+    grassMaterial.uniforms.uColorMult.value = 0.32;  // dim the saturated grass tips
+    stars.visible = true;
+    fireflies.visible = true;
+    butterflies.visible = false;  // butterflies sleep at night
+    clouds.visible = false;       // day clouds look weird against the dark sky
+  } else {
+    scene.background.set(0x87ceeb);
+    scene.fog.color.set(0xb8d8ee);
+    scene.fog.near = 120;
+    scene.fog.far  = 320;
+    hemi.color.set(0xbcdfff);
+    hemi.groundColor.set(0x4a5530);
+    hemi.intensity = 1.1;
+    sun.color.set(0xfff2cc);
+    sun.intensity = 3.2;
+    renderer.toneMappingExposure = 1.15;
+    grassMaterial.uniforms.uColorMult.value = 1.0;
+    stars.visible = false;
+    fireflies.visible = false;
+    butterflies.visible = true;
+    clouds.visible = true;
+  }
+  toggleBtn.textContent = isNight ? 'Day' : 'Night';
+  applyLight();  // light is only on when night && user-toggle on
+}
+toggleBtn.addEventListener('click', () => { isNight = !isNight; applyDayNight(); });
+addEventListener('keydown', (e) => {
+  if (e.code === 'KeyN') { isNight = !isNight; applyDayNight(); }
+});
 
 const clock = new THREE.Clock();
 
@@ -1040,7 +1301,16 @@ function animate() {
   cloudMaterial.uniforms.uPlayerPos.value.copy(player.position);
 
   butterflyMaterial.uniforms.uTime.value = totalElapsed;
-  updateButterflies(dt, totalElapsed);
+  if (!isNight) updateButterflies(dt, totalElapsed);
+
+  // Stars + fireflies: keep time uniforms ticking so they don't pop when toggled on,
+  // but skip the firefly wander update during the day (cheap, but no point doing it).
+  starMaterial.uniforms.uTime.value    = totalElapsed;
+  fireflyMaterial.uniforms.uTime.value = totalElapsed;
+  if (isNight) {
+    stars.position.copy(player.position);  // keep the star dome centered on the camera
+    updateFireflies(dt, totalElapsed);
+  }
 
   if (mixer) {
     mixer.update(dt);
