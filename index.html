@@ -13,7 +13,57 @@
       color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.5);
       pointer-events: none; user-select: none;
     }
-  </style>
+    /* Build menu: pinned to the right edge, vertical list of placeable items. */
+    #buildMenu {
+      position: fixed; top: 50%; right: 12px; transform: translateY(-50%);
+      display: none; flex-direction: column; gap: 6px;
+      font: 14px/1 -apple-system, system-ui, sans-serif;
+      user-select: none;
+    }
+    #buildMenu .item, #buildMenu .cancel {
+      background: rgba(0,0,0,0.45);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.22);
+      border-radius: 6px;
+      padding: 8px 12px;
+      cursor: pointer;
+      display: flex; align-items: center; gap: 8px;
+      min-width: 118px;
+    }
+    #buildMenu .item:hover, #buildMenu .cancel:hover {
+      background: rgba(0,0,0,0.6);
+    }
+    #buildMenu .item.selected {
+      background: rgba(255, 204, 100, 0.42);
+      border-color: rgba(255, 204, 100, 0.95);
+    }
+    #buildMenu .cancel {
+      justify-content: center;
+      margin-top: 4px;
+      background: rgba(0,0,0,0.32);
+    }
+    #buildMenu .item.disabled {
+      opacity: 0.42;
+      cursor: not-allowed;
+    }
+    #buildMenu .item .cost { opacity: 0.75; margin-left: auto; }
+    #layerHud {
+      position: fixed; right: 12px;
+      /* Sits just below the bottom of the build menu (translateY:-50% from 50%).
+         The exact value is approximate — the menu height is dynamic — so we
+         anchor from 50% and push down by a static amount that works for 4 buttons. */
+      top: calc(50% + 170px);
+      font: 13px/1.2 -apple-system, system-ui, sans-serif;
+      color: #fff;
+      background: rgba(0,0,0,0.45);
+      border: 1px solid rgba(255,255,255,0.22);
+      border-radius: 6px;
+      padding: 6px 10px;
+      pointer-events: none;
+      user-select: none;
+      display: none;
+    }
+</style>
   <script type="importmap">
   {
     "imports": {
@@ -26,7 +76,9 @@
   </script>
 </head>
 <body>
-  <div id="hud">WASD to move &middot; drag to orbit &middot; SPACE near a tree to climb &middot; N: night &middot; L: lantern</div>
+  <div id="hud">WASD: move &middot; drag to orbit &middot; SPACE: chop tree &middot; P: plant sapling &middot; B: build mode &middot; in build: 1/2 part, R rotate, Q/E layer, left-click place, right-click remove (drag to orbit), ESC exit</div>
+  <div id="buildMenu"></div>
+  <div id="layerHud">Layer: 0</div>
   <script type="module" src="./main.js"></script>
 </body>
 </html>
